@@ -29,6 +29,115 @@ from vllm.v1.attention.backends.registry import (register_backend, AttentionBack
 from vllm._aiter_ops import rocm_aiter_ops
 
 logger = init_logger()
+_KV_B_PROJ_FALLBACK_LOGGED: set[tuple[str, str, str, str]] = set()
+
+
+def _log_kv_b_proj_fallback_once(
+    log_prefix: str,
+    reason: str,
+    kv_b_proj_type: str,
+    fallback_type: str,
+    level: str = "info",
+):
+    key = (log_prefix, reason, kv_b_proj_type, fallback_type)
+    if key in _KV_B_PROJ_FALLBACK_LOGGED:
+        return
+    _KV_B_PROJ_FALLBACK_LOGGED.add(key)
+
+    log_fn = logger.info
+    if level == "warning":
+        log_fn = logger.warning
+    elif level == "debug":
+        log_fn = logger.debug
+
+    log_fn(
+        "%s kv_b_proj fallback enabled (%s). kv_b_proj=%s, fallback=%s",
+        log_prefix,
+        reason,
+        kv_b_proj_type,
+        fallback_type,
+    )
+
+
+def _resolve_kv_b_proj_fallback_module(kv_b_proj, stashed=None, x_device: Optional[torch.device] = None):
+    candidates = []
+    for attr in ("orig_mod", "_orig_mod", "module", "_module"):
+        unwrapped = getattr(kv_b_proj, attr, None)
+        if unwrapped is not None and unwrapped is not kv_b_proj and callable(unwrapped):
+            candidates.append(unwrapped)
+
+    if stashed is not None and stashed is not kv_b_proj and callable(stashed):
+        candidates.append(stashed)
+
+    if not candidates:
+        return None
+
+    if x_device is None:
+        return candidates[0]
+
+    for candidate in candidates:
+        weight = getattr(candidate, "weight", None)
+        if weight is None or not hasattr(weight, "device"):
+            return candidate
+        if weight.device == x_device:
+            return candidate
+
+    # Do not move modules between devices in decode hot path.
+    return None
+
+
+def _call_kv_b_proj_with_fallback(owner, x: torch.Tensor, log_prefix: str):
+    if owner._kv_b_proj_fallback is not None:
+        return owner._kv_b_proj_fallback(x)
+
+    # In INC mode we can proactively pick the stable pre-convert module.
+    # This avoids a no-measures exception in a hot decode path.
+    prefer_orig_on_inc = os.getenv("VLLM_GAUDI_MLA_KV_B_PROJ_PREFER_ORIG_ON_INC", "1") == "1"
+    if prefer_orig_on_inc and os.getenv("QUANT_CONFIG", None) is not None:
+        fallback_module = _resolve_kv_b_proj_fallback_module(
+            owner.kv_b_proj,
+            getattr(owner, "_kv_b_proj_orig", None),
+            x.device,
+        )
+        if fallback_module is not None:
+            owner._kv_b_proj_fallback = fallback_module
+            if not owner._kv_b_proj_fallback_logged:
+                owner._kv_b_proj_fallback_logged = True
+                _log_kv_b_proj_fallback_once(
+                    log_prefix,
+                    "proactive-inc",
+                    type(owner.kv_b_proj).__name__,
+                    type(owner._kv_b_proj_fallback).__name__,
+                    level="info",
+                )
+            return fallback_module(x)
+
+    try:
+        return owner.kv_b_proj(x)
+    except Exception as e:
+        # INC quantization can fail to map measures for one alias path of a
+        # shared module. Fallback to the unwrapped module when available.
+        if "no measures were supplied" not in str(e):
+            raise
+
+        fallback_module = _resolve_kv_b_proj_fallback_module(
+            owner.kv_b_proj,
+            getattr(owner, "_kv_b_proj_orig", None),
+            x.device,
+        )
+        if fallback_module is None:
+            raise
+        owner._kv_b_proj_fallback = fallback_module
+        if not owner._kv_b_proj_fallback_logged:
+            owner._kv_b_proj_fallback_logged = True
+            _log_kv_b_proj_fallback_once(
+                log_prefix,
+                "no-measures",
+                type(owner.kv_b_proj).__name__,
+                type(owner._kv_b_proj_fallback).__name__,
+                level="warning",
+            )
+        return fallback_module(x)
 
 
 class HPUAttentionBackend(AttentionBackend):
@@ -280,6 +389,8 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             assert sinks.shape[0] == num_heads, ("Sinks must have the same number of heads as the number of "
                                                  f"heads in the layer. Sinks shape: {sinks.shape}, "
                                                  f"num_heads: {num_heads}.")
+        self._kv_b_proj_fallback = None
+        self._kv_b_proj_fallback_logged = False
 
     def forward_mha(  # type: ignore
             self, q: torch.Tensor, latent_vec_k: torch.Tensor, k_cache: torch.Tensor,
@@ -301,7 +412,7 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         k_c_normed, k_pe = latent_vec_k.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
 
-        kv_nope = self.kv_b_proj(k_c_normed)[0]\
+        kv_nope = _call_kv_b_proj_with_fallback(self, k_c_normed, "MLA")[0]\
             .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = kv_nope\
             .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
@@ -1090,6 +1201,8 @@ class HPUUnifiedMLAImpl(MLACommonImpl[HPUUnifiedAttentionMetadata], torch.nn.Mod
             else VLLMFP8KVCache()
         self.is_aiter_triton_fp8_bmm_enabled = False
         self.is_aiter_triton_fp4_bmm_enabled = False
+        self._kv_b_proj_fallback = None
+        self._kv_b_proj_fallback_logged = False
 
     def forward(
         self,
@@ -1144,7 +1257,7 @@ class HPUUnifiedMLAImpl(MLACommonImpl[HPUUnifiedAttentionMetadata], torch.nn.Mod
             # kv_b_proj expands latent → [k_nope, v] but we only need k_nope here
             # V stays compressed! unified_mla will apply W_UV projection later
             # Shape: [tokens, kv_lora_rank] → [tokens, num_heads, qk_nope_head_dim + v_head_dim]
-            kv_nope = self.kv_b_proj(k_c_normed_causal)[0]\
+            kv_nope = _call_kv_b_proj_with_fallback(self, k_c_normed_causal, "UnifiedMLA")[0]\
                 .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, _ = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 

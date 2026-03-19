@@ -996,6 +996,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.profiler_counter_helper = HabanaProfilerCounterHelper()
 
         self.defragmenter = OnlineDefragmenter()
+        # Runtime defragmentation can trigger PT_DEVMEM OOM on long INC FP8
+        # benchmark runs. Keep it off by default for this path; allow opt-in.
+        defrag_inc_fp8_env = os.getenv("VLLM_GAUDI_ENABLE_DEFRAG_INC_FP8")
+        if defrag_inc_fp8_env is None:
+            defrag_inc_fp8_enabled = False
+        else:
+            defrag_inc_fp8_enabled = defrag_inc_fp8_env.strip().lower() in ("1", "true")
+        self._disable_defrag_for_inc_fp8 = (os.getenv("QUANT_CONFIG") is not None
+                                            and self.vllm_config.cache_config.cache_dtype == "fp8_inc"
+                                            and not defrag_inc_fp8_enabled)
+        if self._disable_defrag_for_inc_fp8 and self.defragmenter.enabled:
+            self.defragmenter.enabled = False
+            logger.warning("Disabling runtime defragmenter for INC FP8 to avoid PT_DEVMEM OOM "
+                           "(set VLLM_GAUDI_ENABLE_DEFRAG_INC_FP8=1 to force-enable).")
         self.debug_fwd = init_debug_logger('fwd')
 
         self.get_dp_padding = partial(get_dp_padding,
@@ -3192,6 +3206,112 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         quant_config = os.getenv("QUANT_CONFIG", None) is not None
         return (self.model_config.quantization == "inc" or quant_config)
 
+    def _is_inc_fp8_kv_cache(self) -> bool:
+        return self._is_quant_with_inc() and self.vllm_config.cache_config.cache_dtype == "fp8_inc"
+
+    def _prepare_decode_buckets_for_warmup(self, decode_buckets, decode_limit: int):
+        buckets = sorted(set(decode_buckets))
+
+        if self._is_inc_fp8_kv_cache() and buckets:
+            max_runtime_ctx = max(bucket[2] for bucket in buckets)
+
+            max_seed_bs = max(bucket[0] for bucket in buckets)
+            target_bs = self.max_num_seqs
+            if target_bs > max_seed_bs:
+                seed_ctxs = sorted({max(target_bs, bucket[2]) for bucket in buckets if bucket[0] == max_seed_bs})
+                if max_runtime_ctx not in seed_ctxs:
+                    seed_ctxs.append(max_runtime_ctx)
+
+                new_extra = [(target_bs, 1, ctx) for ctx in seed_ctxs if (target_bs, 1, ctx) not in buckets]
+                if new_extra:
+                    buckets.extend(new_extra)
+                    existing_decode_buckets = list(self.bucketing_manager.decode_buckets)
+                    self.bucketing_manager.decode_buckets = sorted(set(existing_decode_buckets + new_extra))
+                    logger.warning(
+                        "Added %s INC FP8 decode warmup buckets for max_num_seqs=%s "
+                        "to avoid runtime fallback compilation.",
+                        len(new_extra),
+                        target_bs,
+                    )
+
+        if decode_limit > 0 and len(buckets) > decode_limit:
+            buckets_by_bs = collections.defaultdict(list)
+            for bucket in buckets:
+                buckets_by_bs[bucket[0]].append(bucket)
+            for bs in buckets_by_bs:
+                buckets_by_bs[bs] = sorted(buckets_by_bs[bs], key=lambda b: b[2])
+
+            selected: list[tuple[int, int, int]] = []
+            selected_set: set[tuple[int, int, int]] = set()
+
+            def add_bucket(bucket):
+                if bucket not in selected_set and len(selected) < decode_limit:
+                    selected.append(bucket)
+                    selected_set.add(bucket)
+
+            # Keep anchors for small-batch/small-context and high-batch/high-context
+            # shapes to reduce runtime "not warmed-up" compilations.
+            sorted_bs = sorted(buckets_by_bs.keys())
+            anchor_bs = set(sorted_bs[:3])
+            if 1 in buckets_by_bs:
+                anchor_bs.add(1)
+            if 4 in buckets_by_bs:
+                anchor_bs.add(4)
+            if self.max_num_seqs in buckets_by_bs:
+                anchor_bs.add(self.max_num_seqs)
+
+            for bs in sorted(anchor_bs):
+                bs_buckets = buckets_by_bs[bs]
+                anchor_indices = [0, len(bs_buckets) - 1]
+                if len(bs_buckets) > 2:
+                    anchor_indices.append(len(bs_buckets) // 2)
+                if len(bs_buckets) > 3:
+                    anchor_indices.append(1)
+                for idx in sorted(set(anchor_indices)):
+                    add_bucket(bs_buckets[idx])
+
+            # Fill remaining slots in round-robin order across batch-size groups,
+            # prioritizing higher-context buckets.
+            fill_bs_order = []
+            if self.max_num_seqs in buckets_by_bs:
+                fill_bs_order.append(self.max_num_seqs)
+            fill_bs_order.extend(bs for bs in sorted(buckets_by_bs.keys(), reverse=True) if bs != self.max_num_seqs)
+
+            per_bs_candidates = {
+                bs: sorted(buckets_by_bs[bs], key=lambda b: b[2], reverse=True)
+                for bs in fill_bs_order
+            }
+            per_bs_idx = {bs: 0 for bs in fill_bs_order}
+
+            while len(selected) < decode_limit:
+                progressed = False
+                for bs in fill_bs_order:
+                    candidates = per_bs_candidates[bs]
+                    idx = per_bs_idx[bs]
+                    while idx < len(candidates) and candidates[idx] in selected_set:
+                        idx += 1
+                    per_bs_idx[bs] = idx
+                    if idx >= len(candidates):
+                        continue
+                    add_bucket(candidates[idx])
+                    per_bs_idx[bs] += 1
+                    progressed = True
+                    if len(selected) >= decode_limit:
+                        break
+                if not progressed:
+                    break
+
+            logger.info(
+                "Limiting decode warmup buckets from %s to %s using coverage-aware "
+                "selection across %s batch-size groups",
+                len(buckets),
+                len(selected),
+                len(buckets_by_bs),
+            )
+            buckets = sorted(selected)
+
+        return sorted(set(buckets))
+
     # Copied from vllm/v1/worker/gpu_model_runner.py
     def apply_grammar_bitmask(
         self,
@@ -3451,7 +3571,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                  scheduler_output.scheduled_cached_reqs.new_block_ids) if new_block_ids
             }
             self.defragmenter.update_state(new | cached, scheduler_output.finished_req_ids)
-            self.defragmenter.defragment()
+            try:
+                self.defragmenter.defragment()
+            except RuntimeError as e:
+                msg = str(e)
+                if "PT_DEVMEM" in msg or "No enough memory for defragment" in msg:
+                    self.defragmenter.enabled = False
+                    logger.warning(
+                        "Disabling runtime defragmenter after device-memory failure: %s",
+                        msg,
+                    )
+                    return
+                raise
 
     def prepare_unified_batch(self, scheduler_output):
         num_reqs = len(self.input_batch.req_ids)
@@ -4503,12 +4634,40 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     for m in duplicate_mods:
                         if hasattr(self_attn, m) and hasattr(mla_attn, m):
                             delattr(self_attn, m)
-                    if hasattr(mla_attn, "mla_attn") and hasattr(mla_attn.mla_attn, "impl"):
-                        mla_impl = mla_attn.mla_attn.impl
-                        duplicate_mods = ["kv_b_proj"]
+
+                    # Support both MLA topologies:
+                    # 1) Plain: self_attn.mla_attn.impl
+                    # 2) Wrapped: self_attn.mla_attn.mla_attn.impl
+                    mla_core = None
+                    if hasattr(mla_attn, "impl"):
+                        mla_core = mla_attn
+                    elif hasattr(mla_attn, "mla_attn") and hasattr(mla_attn.mla_attn, "impl"):
+                        mla_core = mla_attn.mla_attn
+
+                    if mla_core is not None:
+                        mla_impl = mla_core.impl
+                        if (hasattr(mla_impl, "kv_b_proj") and isinstance(mla_impl.kv_b_proj, torch.nn.Module)
+                                and not hasattr(mla_impl, "_kv_b_proj_orig")):
+                            # Keep a stable pre-INC handle as a runtime fallback
+                            # when INC wrapper layer-name mapping misses measures.
+                            mla_impl._kv_b_proj_orig = mla_impl.kv_b_proj
+                        duplicate_mods = [
+                            "latent_cache_k",
+                            "matmul_qk",
+                            "softmax",
+                            "matmul_av",
+                            "batch2block_matmul",
+                            "block2batch_matmul",
+                            "k_cache",
+                            "v_cache",
+                            "fused_scaled_dot_product_attention",
+                            "kv_b_proj",
+                        ]
                         for m in duplicate_mods:
-                            if hasattr(mla_attn, m) and hasattr(mla_impl, m):
-                                delattr(mla_attn, m)
+                            if (hasattr(mla_core, m) and hasattr(mla_impl, m)
+                                    and isinstance(getattr(mla_core, m), torch.nn.Module)
+                                    and isinstance(getattr(mla_impl, m), torch.nn.Module)):
+                                delattr(mla_core, m)
 
                 # Remove duplicate gate from SharedFusedMoE.
                 # Models like Qwen3MoE, DeepSeek-V2, etc. pass the
@@ -5565,10 +5724,37 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             self.bucketing_manager.prompt_buckets, True, kv_caches)
                     self.log_graph_warmup_summary(self.bucketing_manager.prompt_buckets, True, mem_post_prompt)
                     if not self.is_pooling_model:
+                        decode_buckets_for_warmup = self.bucketing_manager.decode_buckets
+                        max_decode_warmup_buckets = os.getenv("VLLM_GAUDI_MAX_DECODE_WARMUP_BUCKETS")
+                        if max_decode_warmup_buckets is None and self._is_inc_fp8_kv_cache():
+                            # Keep a conservative default for startup stability on
+                            # INC FP8. Override via env when a larger warmup budget
+                            # is validated in a target environment.
+                            max_decode_warmup_buckets = os.getenv(
+                                "VLLM_GAUDI_INC_FP8_DEFAULT_MAX_DECODE_WARMUP_BUCKETS",
+                                "32",
+                            )
+
+                        decode_limit = 0
+                        if max_decode_warmup_buckets is not None:
+                            try:
+                                decode_limit = int(max_decode_warmup_buckets)
+                            except ValueError:
+                                decode_limit = 0
+                                logger.warning(
+                                    "Ignoring invalid VLLM_GAUDI_MAX_DECODE_WARMUP_BUCKETS=%s",
+                                    max_decode_warmup_buckets,
+                                )
+
+                        decode_buckets_for_warmup = self._prepare_decode_buckets_for_warmup(
+                            decode_buckets_for_warmup,
+                            decode_limit,
+                        )
+
                         mem_post_decode, decode_batch_seq, decode_captured_all = \
                           self.warmup_graphs(
-                              self.bucketing_manager.decode_buckets, False, kv_caches)
-                        self.log_graph_warmup_summary(self.bucketing_manager.decode_buckets, False, mem_post_decode)
+                              decode_buckets_for_warmup, False, kv_caches)
+                        self.log_graph_warmup_summary(decode_buckets_for_warmup, False, mem_post_decode)
 
         end_time = time.perf_counter()
         end_mem = HabanaMemoryProfiler.current_device_memory_usage()
@@ -5590,6 +5776,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # and re-initialize it.
         if not self.is_pooling_model:
             self.defragmenter = OnlineDefragmenter()
+            if self._disable_defrag_for_inc_fp8 and self.defragmenter.enabled:
+                self.defragmenter.enabled = False
             self.defragmenter.initialize(self.kv_caches, self.block_size)
 
     def shutdown_inc(self, suppress=suppress, finalize_calibration=finalize_calibration):

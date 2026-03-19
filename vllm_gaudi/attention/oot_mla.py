@@ -22,24 +22,45 @@ class HPUMLAAttention(MLAAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.enable_fp8_attn = self.kv_cache_dtype == 'fp8_inc' and os.environ.get('QUANT_CONFIG', None) is None
-        self.latent_cache_k = VLLMKVCache() if not self.enable_fp8_attn else VLLMFP8KVCache()
         self.scale = float(self.scale)
-        self.matmul_qk = Matmul() if not self.enable_fp8_attn \
-            else FP8Matmul()
-        self.softmax = Softmax()
-        self.matmul_av = Matmul() if not self.enable_fp8_attn \
-            else FP8Matmul()
-        self.batch2block_matmul = B2BMatmul() if not self.enable_fp8_attn \
-            else FP8Matmul()
-        self.block2batch_matmul = B2BMatmul() if not self.enable_fp8_attn \
-            else FP8Matmul()
-        self.k_cache = VLLMKVCache() if not self.enable_fp8_attn \
-            else VLLMFP8KVCache()
-        self.v_cache = VLLMKVCache(is_v_cache=True) if not self.enable_fp8_attn \
-            else VLLMFP8KVCache()
-        HPUFusedSDPA = kernels.fsdpa()
-        self.fused_scaled_dot_product_attention = None if HPUFusedSDPA is None \
-            else ModuleFusedSDPA(HPUFusedSDPA)
+        if not hasattr(self.impl, "latent_cache_k"):
+            self.latent_cache_k = VLLMKVCache() if not self.enable_fp8_attn else VLLMFP8KVCache()
+        if not hasattr(self.impl, "matmul_qk"):
+            self.matmul_qk = Matmul() if not self.enable_fp8_attn else FP8Matmul()
+        if not hasattr(self.impl, "softmax"):
+            self.softmax = Softmax()
+        if not hasattr(self.impl, "matmul_av"):
+            self.matmul_av = Matmul() if not self.enable_fp8_attn else FP8Matmul()
+        if not hasattr(self.impl, "batch2block_matmul"):
+            self.batch2block_matmul = B2BMatmul() if not self.enable_fp8_attn else FP8Matmul()
+        if not hasattr(self.impl, "block2batch_matmul"):
+            self.block2batch_matmul = B2BMatmul() if not self.enable_fp8_attn else FP8Matmul()
+        if not hasattr(self.impl, "k_cache"):
+            self.k_cache = VLLMKVCache() if not self.enable_fp8_attn else VLLMFP8KVCache()
+        if not hasattr(self.impl, "v_cache"):
+            self.v_cache = VLLMKVCache(is_v_cache=True) if not self.enable_fp8_attn else VLLMFP8KVCache()
+        if not hasattr(self.impl, "fused_scaled_dot_product_attention"):
+            HPUFusedSDPA = kernels.fsdpa()
+            self.fused_scaled_dot_product_attention = None if HPUFusedSDPA is None else ModuleFusedSDPA(HPUFusedSDPA)
+
+        # INC names layers by module path. Keep shared modules registered only on impl
+        # so measurements and quantized calls use the same canonical path.
+        duplicate_mods = [
+            "latent_cache_k",
+            "matmul_qk",
+            "softmax",
+            "matmul_av",
+            "batch2block_matmul",
+            "block2batch_matmul",
+            "k_cache",
+            "v_cache",
+            "fused_scaled_dot_product_attention",
+        ]
+        for mod_name in duplicate_mods:
+            wrapper_mod = getattr(self, mod_name, None)
+            impl_mod = getattr(self.impl, mod_name, None)
+            if isinstance(wrapper_mod, torch.nn.Module) and isinstance(impl_mod, torch.nn.Module):
+                delattr(self, mod_name)
 
     def forward(
         self,
@@ -144,7 +165,10 @@ class HPUMLAAttention(MLAAttention):
 
         # write the latent and rope to kv cache
         if kv_cache is not None and len(kv_cache) >= 2:
-            self.latent_cache_k(latent_vec_k, kv_cache[0], slot_mapping)
+            if hasattr(self.impl, "latent_cache_k"):
+                self.impl.latent_cache_k(latent_vec_k, kv_cache[0], slot_mapping)
+            else:
+                self.latent_cache_k(latent_vec_k, kv_cache[0], slot_mapping)
 
         if is_prefill:
             output = self.impl.forward_mha(q, latent_vec_k, kv_cache, attn_metadata)

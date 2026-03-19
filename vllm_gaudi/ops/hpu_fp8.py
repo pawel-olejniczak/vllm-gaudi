@@ -220,13 +220,14 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
 
         topk_ids = topk_ids.view(-1, topk_ids.shape[-1])
         topk_weights = topk_weights.view(-1, topk_weights.shape[-1])
+        activation = getattr(layer.activation, "value", layer.activation)
 
         output = layer.moe_op(
             x,
             topk_ids,
             topk_weights,
             permuted_weights=True,
-            activation=layer.activation,
+            activation=activation,
         )
         return output.view(*(output.size(0), *input_shape[1:]))
 
