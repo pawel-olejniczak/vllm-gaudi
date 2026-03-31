@@ -1,5 +1,8 @@
+import contextlib
 import logging
 import os
+import shutil
+import sysconfig
 
 from setuptools import setup, find_packages
 from setuptools_scm import get_version
@@ -59,6 +62,8 @@ setup(
         "Operating System :: OS Independent",
     ],
     packages=find_packages(exclude=("docs", "examples", "tests*", "csrc")),
+    py_modules=['_vllm_gaudi_torch_compat'],
+    data_files=[(sysconfig.get_path('purelib'), ['_vllm_gaudi_torch_compat.pth'])],
     install_requires=get_requirements(),
     ext_modules=ext_modules,
     extras_require={},
@@ -71,3 +76,11 @@ setup(
         ],
     },
 )
+
+# Best-effort: for editable installs (PEP 660) data_files are not
+# processed, so copy the .pth file to site-packages directly.
+_pth_src = os.path.join(ROOT_DIR, '_vllm_gaudi_torch_compat.pth')
+_pth_dst = os.path.join(sysconfig.get_path('purelib'), '_vllm_gaudi_torch_compat.pth')
+if os.path.exists(_pth_src) and not os.path.exists(_pth_dst):
+    with contextlib.suppress(OSError, PermissionError):
+        shutil.copy2(_pth_src, _pth_dst)
