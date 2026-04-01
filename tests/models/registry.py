@@ -9,7 +9,7 @@ import pytest
 from packaging.version import Version
 from transformers import __version__ as TRANSFORMERS_VERSION
 
-from vllm.config import TokenizerMode
+from vllm.config.model import TokenizerMode
 
 
 @dataclass(frozen=True)
