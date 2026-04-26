@@ -428,6 +428,7 @@ jobs:
           EXITCODE=$?
           echo "Test script exited with code: $EXITCODE"
   hpu_pd_tests:
+    if: false  # Temporarily disabled — NIXL not available on CI runner. Will be fixed in a separate PR.
     # --- UPDATED: Add discover_runner dependency ---
     needs: [pre_merge_hpu_test_build, hpu_unit_tests, discover_runner, retrieve_head_sha]
     # --- UPDATED: Run on the specific node ---
