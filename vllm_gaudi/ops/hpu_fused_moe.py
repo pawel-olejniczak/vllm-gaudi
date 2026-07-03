@@ -414,6 +414,7 @@ def create_fused_moe_router(
     topk_group: int | None = None,
     scoring_func: str = "softmax",
     num_fused_shared_experts: int = 0,
+    shared_expert_weight: float = 1.0,
     # grouped topk + fused topk bias parameters
     routed_scaling_factor: float = 1.0,
     e_score_correction_bias: torch.Tensor | None = None,
@@ -536,6 +537,8 @@ def create_fused_moe_router(
             renormalize=renormalize,
             routed_scaling_factor=routed_scaling_factor,
             hash_indices_table=hash_indices_table,
+            num_fused_shared_experts=num_fused_shared_experts,
+            shared_expert_weight=shared_expert_weight,
         )
 
     return FusedTopKRouter(
